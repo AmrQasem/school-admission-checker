@@ -1,0 +1,57 @@
+name: Check School Admissions
+
+on:
+  # Manual "Run workflow" button in the Actions tab, for testing.
+  workflow_dispatch: {}
+
+  schedule:
+    # --- Normal monitoring: once every hour, every day of the year (UTC). ---
+    - cron: '0 * * * *'
+
+    # --- Intensive monitoring around Oct 1, 2026 (expected admissions-open day) ---
+    # GitHub Actions cron always runs in UTC. Egypt is UTC+2 or UTC+3 depending on
+    # daylight saving, so "October 1st in Cairo" can start as early as 21:00 UTC
+    # on Sept 30 and end as late as ~22:00 UTC on Oct 1. To be safe, we run every
+    # 15 minutes across that whole window:
+    - cron: '*/15 20-23 30 9 *'   # last hours of Sep 30 (UTC) - covers early Oct 1 in Cairo
+    - cron: '*/15 * 1 10 *'       # all of Oct 1 (UTC)
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run admissions checker
+        env:
+          # --- Email (sent via Gmail SMTP) ---
+          EMAIL_SENDER: dohasaeed61@gmail.com
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENTS: "amrkasem47@yahoo.com,dohasaeed61@gmail.com"
+
+          # --- Phone-call alert (via CallMeBot's call API - see README) ---
+          CALLMEBOT_PHONE_1: "201020807249"
+          CALLMEBOT_APIKEY_1: ${{ secrets.CALLMEBOT_APIKEY_1 }}
+          CALLMEBOT_PHONE_2: "201060471410"
+          CALLMEBOT_APIKEY_2: ${{ secrets.CALLMEBOT_APIKEY_2 }}   # leave unset until Amr activates his own number
+        run: python check_admissions.py
+
+      - name: Commit updated state (so we don't re-notify the same match)
+        run: |
+          git config user.name "admissions-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "chore: update admission-check state"
+          git push

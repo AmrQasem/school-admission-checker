@@ -8,13 +8,10 @@ on:
     # --- Normal monitoring: once every hour, every day of the year (UTC). ---
     - cron: '0 * * * *'
 
-    # --- Intensive monitoring around Oct 1, 2026 (expected admissions-open day) ---
-    # GitHub Actions cron always runs in UTC. Egypt is UTC+2 or UTC+3 depending on
-    # daylight saving, so "October 1st in Cairo" can start as early as 21:00 UTC
-    # on Sept 30 and end as late as ~22:00 UTC on Oct 1. To be safe, we run every
-    # 15 minutes across that whole window:
-    - cron: '*/15 20-23 30 9 *'   # last hours of Sep 30 (UTC) - covers early Oct 1 in Cairo
-    - cron: '*/15 * 1 10 *'       # all of Oct 1 (UTC)
+    # --- Intensive monitoring on Oct 1, 2026, 8 AM - 1 PM Cairo/Riyadh time ---
+    # Egypt is on daylight saving (UTC+3) until Oct 29, 2026, so 8 AM-1 PM
+    # Cairo local = 05:00-09:59 UTC. Runs every 15 minutes in that window only.
+    - cron: '*/15 5-9 1 10 *'
 
 permissions:
   contents: write

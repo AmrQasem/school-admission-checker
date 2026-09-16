@@ -54,6 +54,16 @@ HEADERS = {
 CONTEXT_CHARS = 120  # characters of surrounding text to capture in the snippet
 REQUEST_TIMEOUT = 30
 
+# "Apply Now" is very often a *permanent* nav-bar/footer button on school sites
+# (it links to a generic, evergreen application form) - it does NOT reliably
+# mean a new admissions cycle just opened. To avoid false-positive alerts from
+# that permanent button, we only count an "Apply Now" match if the surrounding
+# text also mentions the academic year we care about. The more specific
+# Arabic phrases are left as-is since they're far less likely to be permanent
+# site chrome.
+GENERIC_KEYWORDS_REQUIRE_YEAR_HINT = {"apply now"}
+YEAR_HINTS = ["2027", "2028", "27/28", "27-28"]
+
 
 # ---------------------------------------------------------------------------
 # State handling
@@ -104,6 +114,17 @@ def find_matches(text):
             snippet_start = max(0, idx - CONTEXT_CHARS)
             snippet_end = min(len(text), idx + len(kw) + CONTEXT_CHARS)
             snippet = " ".join(text[snippet_start:snippet_end].split())
+
+            if kw_lower in GENERIC_KEYWORDS_REQUIRE_YEAR_HINT:
+                # Look a bit wider than the snippet itself for a year hint,
+                # since the year might sit just outside the tight snippet window.
+                wide_start = max(0, idx - CONTEXT_CHARS * 3)
+                wide_end = min(len(text), idx + len(kw) + CONTEXT_CHARS * 3)
+                wide_context = text[wide_start:wide_end]
+                if not any(hint in wide_context for hint in YEAR_HINTS):
+                    start = idx + len(kw)
+                    continue  # generic button/link with no year context - skip
+
             matches.append((kw, snippet))
             start = idx + len(kw)
     return matches

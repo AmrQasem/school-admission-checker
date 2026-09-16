@@ -8,16 +8,22 @@ detectors:
 
 1. HIGH-CONFIDENCE keyword match: specific admission phrases ("فتح باب
    التقديم", "سجل الآن", ...) or "Apply Now" together with a 2027/2028 year
-   mention. On a NEW match -> sends an email (full Arabic detail) AND places
-   an automated phone call (unless it's currently quiet hours).
+   mention. On a NEW match -> places an automated phone call immediately
+   (unless it's currently quiet hours), and the match is included in this
+   run's summary email.
 
 2. MEDIUM-CONFIDENCE silent-change watchdog: some schools may flip
    admissions open/closed WITHOUT ever changing the wording to mention the
    year at all (the "Apply Now" button/link area just changes quietly). This
    watchdog snapshots the text around every "Apply Now" occurrence and, if it
-   changes from what was last seen, sends an EMAIL ONLY (no phone call,
-   lower confidence, worth a manual look) - it never re-fires for the same
-   text.
+   changes from what was last seen, includes that in this run's summary email
+   too (no phone call - lower confidence, worth a manual look).
+
+Every single run sends EXACTLY ONE summary email, whether or not anything
+new was found ("checked, nothing new" or full details of what changed) -
+Doha asked for a standing reassurance that the checker is alive and working.
+Phone calls are reserved for high-confidence matches only, and are skipped
+during quiet hours.
 
 State (both the notified high-confidence snippets and the watchdog
 baselines) is persisted in state.json so nothing re-notifies on every run;
@@ -87,7 +93,8 @@ QUIET_HOURS_END = 6     # ...through (not including) 6 AM.
 # --- Medium-confidence silent-change watchdog -------------------------------
 # Catches a school quietly flipping admissions open/closed near an "Apply Now"
 # button WITHOUT ever mentioning 2027/2028 anywhere (so the high-confidence
-# check above would never fire). This is intentionally noisier but email-only.
+# check above would never fire). This is intentionally noisier but only ever
+# shows up in the summary email, never triggers a call.
 WATCH_KEYWORD = "apply now"
 WATCH_CONTEXT_CHARS = 400
 
@@ -143,8 +150,6 @@ def find_matches(text):
             snippet = " ".join(text[snippet_start:snippet_end].split())
 
             if kw_lower in GENERIC_KEYWORDS_REQUIRE_YEAR_HINT:
-                # Look a bit wider than the snippet itself for a year hint,
-                # since the year might sit just outside the tight snippet window.
                 wide_start = max(0, idx - CONTEXT_CHARS * 3)
                 wide_end = min(len(text), idx + len(kw) + CONTEXT_CHARS * 3)
                 wide_context = text[wide_start:wide_end]
@@ -182,7 +187,6 @@ def in_quiet_hours():
     now = datetime.now(ZoneInfo(QUIET_HOURS_TZ))
     h = now.hour
     if QUIET_HOURS_START > QUIET_HOURS_END:
-        # window wraps past midnight, e.g. 22 -> 6
         return h >= QUIET_HOURS_START or h < QUIET_HOURS_END
     return QUIET_HOURS_START <= h < QUIET_HOURS_END
 
@@ -220,12 +224,8 @@ def send_phone_call(short_message):
     """
     Place an automated phone call via CallMeBot's call API to each configured
     number, which reads `short_message` aloud with a robot voice. Skipped
-    entirely during quiet hours (see in_quiet_hours()).
-
-    NOTE: CallMeBot's free instant-WhatsApp-text signup is currently closed to
-    new users ("This Bot is full"), so we use their phone-call API instead,
-    which is still open. Keep `short_message` short, in English, and free of
-    newlines/special characters (it's read aloud and passed in a URL).
+    entirely during quiet hours (see in_quiet_hours()). Only ever called for
+    HIGH-confidence matches - never for the routine "all clear" summary.
     """
     if in_quiet_hours():
         print(f"[call] Suppressed (quiet hours, {QUIET_HOURS_TZ}) - would have said: {short_message}")
@@ -255,7 +255,11 @@ def send_phone_call(short_message):
 
 def main():
     state = load_state()
-    any_new = False
+
+    high_confidence_findings = []   # list of (school_name, url, kw_label, snippet)
+    watchdog_findings = []          # list of (school_name, url, contexts)
+    stable_schools = []             # schools with nothing new to report
+    error_schools = []              # (school_name, url, error)
 
     for school in SCHOOLS:
         name, url = school["name"], school["url"]
@@ -266,6 +270,7 @@ def main():
             text = fetch_text(url)
         except Exception as e:
             print(f"[{name}] Error fetching {url}: {e}")
+            error_schools.append((name, url, str(e)))
             state[host] = school_state
             continue
 
@@ -273,85 +278,92 @@ def main():
 
         # --- HIGH confidence: specific phrases / Apply Now + year hint ---
         matches = find_matches(text)
-        if not matches:
-            print(f"[{name}] No high-confidence admission keywords found.")
-        else:
+        if matches:
             already_notified = set(school_state.get("notified_snippets", []))
 
-            # Multiple keywords can match inside the same (overlapping) chunk
-            # of text (e.g. "باب التقديم" is a substring of "فتح باب التقديم"),
-            # which would otherwise produce several near-identical
-            # notifications for one real announcement. Group by the exact
-            # snippet text and send one notification per unique snippet.
             snippet_to_keywords = {}
             for kw, snippet in matches:
                 if snippet in already_notified:
                     continue
                 snippet_to_keywords.setdefault(snippet, []).append(kw)
 
-            if not snippet_to_keywords:
-                print(f"[{name}] Keyword(s) present but already notified for this exact text.")
-            else:
-                for snippet, kws in snippet_to_keywords.items():
-                    kw_label = ", ".join(dict.fromkeys(kws))  # de-dup, keep order
-                    print(f"[{name}] HIGH-CONFIDENCE MATCH -> keyword(s)='{kw_label}' snippet='{snippet}'")
+            for snippet, kws in snippet_to_keywords.items():
+                kw_label = ", ".join(dict.fromkeys(kws))
+                print(f"[{name}] HIGH-CONFIDENCE MATCH -> keyword(s)='{kw_label}' snippet='{snippet}'")
 
-                    subject = f"\U0001F393 تنبيه: باب التقديم مفتوح - {name}"
-                    email_body = (
-                        f"تم رصد إشارة إلى فتح باب التقديم على موقع المدرسة التالية:\n\n"
-                        f"المدرسة: {name}\n"
-                        f"الرابط: {url}\n"
-                        f"الكلمة/الكلمات المطابقة: {kw_label}\n\n"
-                        f"النص كما ظهر بالضبط على الصفحة:\n\"{snippet}\"\n\n"
-                        f"(تم إرسال هذا التنبيه تلقائياً بواسطة سكريبت مراقبة مواقع المدارس)"
-                    )
-                    # Kept short, in English, no newlines: read aloud by a
-                    # robot voice over a phone call, not a chat message.
-                    call_msg = f"Admissions alert. {name} may have opened admissions. Please check your email now."
+                call_msg = f"Admissions alert. {name} may have opened admissions. Please check your email now."
+                send_phone_call(call_msg)
 
-                    send_email(subject, email_body)
-                    send_phone_call(call_msg)
+                already_notified.add(snippet)
+                high_confidence_fired = True
+                high_confidence_findings.append((name, url, kw_label, snippet))
 
-                    already_notified.add(snippet)
-                    any_new = True
-                    high_confidence_fired = True
+            school_state["notified_snippets"] = list(already_notified)
 
-                school_state["notified_snippets"] = list(already_notified)
-
-        # --- MEDIUM confidence: silent change watchdog (email only) ---
+        # --- MEDIUM confidence: silent change watchdog ---
         watch_contexts = get_watch_contexts(text)
         baseline = school_state.get("apply_now_watch_baseline")
+        watchdog_fired = False
 
         if baseline is None:
-            # First time watching this school - just establish the baseline.
+            # First time watching this school - just establish the baseline silently.
             school_state["apply_now_watch_baseline"] = watch_contexts
             print(f"[{name}] Watchdog baseline established ({len(watch_contexts)} Apply-Now area(s)).")
-        elif watch_contexts != baseline and not high_confidence_fired:
-            print(f"[{name}] WATCHDOG: content near 'Apply Now' changed since last check.")
-            subject = f"\U0001F440 ملاحظة: حصل تغيير حوالين زرار Apply Now - {name} (يستحق المراجعة اليدوية)"
-            new_text_preview = "\n---\n".join(watch_contexts) if watch_contexts else "(لم يعد الزر موجود في الصفحة)"
-            email_body = (
-                f"لاحظ السكريبت تغييراً في محتوى الصفحة القريب من زرار/رابط \"Apply Now\" في موقع:\n\n"
-                f"المدرسة: {name}\n"
-                f"الرابط: {url}\n\n"
-                f"هذا تنبيه بثقة أقل من التنبيه العادي (مفيش كلمة صريحة زي 2027/2028)، "
-                f"يعني ممكن يكون يكون يكون تحديث بسيط أو حقيقي لفتح التقديم - يُنصح تتأكدي بنفسك بزيارة الموقع.\n\n"
-                f"النص الحالي حوالين الزرار:\n{new_text_preview}\n\n"
-                f"(تنبيه آلي - لن يتكرر لنفس النص)"
-            )
-            send_email(subject, email_body)
+        elif watch_contexts != baseline:
             school_state["apply_now_watch_baseline"] = watch_contexts
-            any_new = True
-        elif watch_contexts != baseline and high_confidence_fired:
-            # Already alerted at high confidence this run - just refresh baseline quietly.
-            school_state["apply_now_watch_baseline"] = watch_contexts
+            if not high_confidence_fired:
+                print(f"[{name}] WATCHDOG: content near 'Apply Now' changed since last check.")
+                watchdog_findings.append((name, url, watch_contexts))
+                watchdog_fired = True
+
+        if not high_confidence_fired and not watchdog_fired:
+            stable_schools.append(name)
 
         state[host] = school_state
 
     save_state(state)
 
-    if not any_new:
-        print("Run complete - no new admission announcements this time.")
+    # --- Always send exactly ONE summary email per run ----------------------
+    now_str = datetime.now(ZoneInfo(QUIET_HOURS_TZ)).strftime("%Y-%m-%d %H:%M")
+    if not high_confidence_findings and not watchdog_findings and not error_schools:
+        subject = "✅ فحص تم - لا جديد في مواقع المدارس"
+        body = (
+            f"تم فحص المواقع التلاتة في {now_str} (توقيت القاهرة/الرياض).\n"
+            f"النتيجة: لا يوجد أي جديد - كل حاجة زي ما هي.\n\n"
+            f"المدارس اللي اتفحصت:\n- " + "\n- ".join(s["name"] for s in SCHOOLS) + "\n\n"
+            f"(رسالة تلقائية تؤكد إن السكريبت شغال تمام)"
+        )
+    else:
+        lines = [f"تم فحص المواقع التلاتة في {now_str} (توقيت القاهرة/الرياض).\n"]
+
+        if high_confidence_findings:
+            lines.append("\U0001F393 تنبيهات مؤكدة (تم عمل مكالمة هاتفية لكل واحدة منها):\n")
+            for name, url, kw_label, snippet in high_confidence_findings:
+                lines.append(
+                    f"- المدرسة: {name}\n  الرابط: {url}\n  الكلمة/الكلمات: {kw_label}\n"
+                    f"  النص بالضبط: \"{snippet}\"\n"
+                )
+
+        if watchdog_findings:
+            lines.append(
+                "\U0001F440 تغييرات محتملة حوالين زرار Apply Now (ثقة أقل - يستحق مراجعة يدوية، من غير مكالمة):\n"
+            )
+            for name, url, contexts in watchdog_findings:
+                preview = "\n---\n".join(contexts) if contexts else "(الزرار مختفي من الصفحة)"
+                lines.append(f"- المدرسة: {name}\n  الرابط: {url}\n  النص الحالي:\n  {preview}\n")
+
+        if error_schools:
+            lines.append("⚠️ مواقع تعذر فحصها في هذه المرة:\n")
+            for name, url, err in error_schools:
+                lines.append(f"- {name} ({url}): {err}\n")
+
+        if stable_schools:
+            lines.append("لا جديد في: " + "، ".join(stable_schools))
+
+        subject = "\U0001F393 تنبيه: فيه جديد في مواقع المدارس - راجعي التفاصيل"
+        body = "\n".join(lines)
+
+    send_email(subject, body)
 
 
 if __name__ == "__main__":
